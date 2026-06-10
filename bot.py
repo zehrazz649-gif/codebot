@@ -1,14 +1,14 @@
 """
-CryptoBot v2 — AES-256-GCM Telegram Şifrələmə Botu
-Yeni funksiyalar:
-  • Token müddəti  (1h / 6h / 24h / 7gün / sınırsız)
-  • Güclü açar generatoru  (/genkey)
-  • Fayl şifrələmə/deşifrələmə  (.txt, .pdf, istənilən binary)
-  • İki tərəfli şifrələmə  (X25519 ECDH + AES-256-GCM)
+CryptoBot v3 — Sadə E2E sistemi
+  • Hər istifadəçinin sabit deep-link adresi var
+  • Göndərən linki açır → mətn yazır → şifrəli gedir
+  • Alan /inbox ilə oxuyur
+  • AES-256-GCM + PBKDF2  |  Fayl şifrələmə  |  Token müddəti  |  /genkey
 """
 
-import os, io, base64, hashlib, struct, logging, secrets, time
+import os, io, base64, hashlib, struct, logging, secrets, time, json
 from datetime import datetime, timezone
+from pathlib import Path
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -17,32 +17,71 @@ from telegram.ext import (
 )
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.backends import default_backend
 
 # ── Logging ───────────────────────────────────────────────────────────────────
-logging.basicConfig(format="%(asctime)s %(name)s %(levelname)s %(message)s", level=logging.INFO)
+logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+BOT_TOKEN  = os.environ.get("BOT_TOKEN", "")
+BOT_USERNAME = os.environ.get("BOT_USERNAME", "your_bot")   # @username-siz, məsələn: mycryptobot
+INBOX_FILE = Path("inbox.json")   # Railway-də /tmp/inbox.json da ola bilər
 
-# ── Conversation states ───────────────────────────────────────────────────────
+# ── States ────────────────────────────────────────────────────────────────────
 (
-    # symmetric encrypt flow
     S_ENC_KEY, S_ENC_EXPIRY, S_ENC_TEXT, S_ENC_FILE,
-    # symmetric decrypt flow
     S_DEC_KEY, S_DEC_TOKEN, S_DEC_FILE,
-    # E2E flow
-    E2E_SEND_PUBKEY, E2E_SEND_MSG,
-    E2E_RECV_PRIVKEY, E2E_RECV_BUNDLE,
-) = range(11)
+    S_SEND_MSG, S_INBOX_KEY,
+) = range(9)
 
-# ── Protocol versions ─────────────────────────────────────────────────────────
-VER_SYM  = b"\x02"   # symmetric  (v2 = with expiry)
-VER_E2E  = b"\x03"   # E2E ECDH
+VER = b"\x02"
 
+EXPIRY_OPTIONS = {
+    "exp_1h":  ("1 saat",   3600),
+    "exp_6h":  ("6 saat",   21600),
+    "exp_24h": ("24 saat",  86400),
+    "exp_7d":  ("7 gün",    604800),
+    "exp_inf": ("Sınırsız", None),
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  INBOX  (sadə JSON fayl storage)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _load_inbox() -> dict:
+    if INBOX_FILE.exists():
+        try:
+            return json.loads(INBOX_FILE.read_text())
+        except Exception:
+            pass
+    return {}
+
+def _save_inbox(data: dict):
+    INBOX_FILE.write_text(json.dumps(data, ensure_ascii=False))
+
+def inbox_add(recipient_id: int, sender_name: str, encrypted_b64: str, expiry_label: str):
+    data = _load_inbox()
+    key  = str(recipient_id)
+    if key not in data:
+        data[key] = []
+    data[key].append({
+        "from":    sender_name,
+        "msg":     encrypted_b64,
+        "expiry":  expiry_label,
+        "time":    int(time.time()),
+    })
+    _save_inbox(data)
+
+def inbox_get(recipient_id: int) -> list:
+    data = _load_inbox()
+    return data.get(str(recipient_id), [])
+
+def inbox_clear(recipient_id: int):
+    data = _load_inbox()
+    data[str(recipient_id)] = []
+    _save_inbox(data)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CRYPTO CORE
@@ -52,124 +91,45 @@ def _pbkdf2(password: str, salt: bytes) -> bytes:
     kdf = PBKDF2HMAC(hashes.SHA256(), 32, salt, 600_000, default_backend())
     return kdf.derive(password.encode())
 
-
 def sym_encrypt(data: bytes, password: str, ttl_seconds: int | None) -> bytes:
-    """
-    Symmetric encrypt (AES-256-GCM + PBKDF2).
-    Wire format:
-      VER(1) | SALT(32) | NONCE(12) | EXPIRES_TS(8, big-endian int64, 0=never) | CT+TAG
-    """
-    salt  = secrets.token_bytes(32)
-    nonce = secrets.token_bytes(12)
-    key   = _pbkdf2(password, salt)
+    salt    = secrets.token_bytes(32)
+    nonce   = secrets.token_bytes(12)
+    key     = _pbkdf2(password, salt)
     expires = int(time.time()) + ttl_seconds if ttl_seconds else 0
-    aad   = struct.pack(">q", expires)          # authenticated additional data
-    ct    = AESGCM(key).encrypt(nonce, data, aad)
-    return VER_SYM + salt + nonce + aad + ct
-
+    aad     = struct.pack(">q", expires)
+    ct      = AESGCM(key).encrypt(nonce, data, aad)
+    return VER + salt + nonce + aad + ct
 
 def sym_decrypt(payload: bytes, password: str) -> bytes:
-    """Decrypt symmetric payload. Raises ValueError on bad password / expiry / tampering."""
     if len(payload) < 1 + 32 + 12 + 8 + 16:
-        raise ValueError("Payload çox qısadır.")
-    if payload[0:1] != VER_SYM:
-        raise ValueError("Versiya uyğun deyil (köhnə token?).")
+        raise ValueError("Token çox qısadır.")
+    if payload[0:1] != VER:
+        raise ValueError("Versiya uyğun deyil.")
     salt    = payload[1:33]
     nonce   = payload[33:45]
     aad     = payload[45:53]
     ct      = payload[53:]
     expires = struct.unpack(">q", aad)[0]
     if expires and time.time() > expires:
-        ts = datetime.fromtimestamp(expires, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        raise ValueError(f"Tokenin müddəti bitib: {ts}")
+        ts = datetime.fromtimestamp(expires, tz=timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
+        raise ValueError(f"Tokenin müddəti bitib ({ts}).")
     key = _pbkdf2(password, salt)
     try:
         return AESGCM(key).decrypt(nonce, ct, aad)
     except Exception:
         raise ValueError("Şifrə yanlışdır və ya məlumat dəyişdirilib.")
 
-
-# ── E2E (X25519 ECDH) ─────────────────────────────────────────────────────────
-
-def e2e_generate_keypair() -> tuple[bytes, bytes]:
-    """Returns (private_bytes_b64, public_bytes_b64)."""
-    priv = X25519PrivateKey.generate()
-    pub  = priv.public_key()
-    priv_b64 = base64.urlsafe_b64encode(
-        priv.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw, serialization.NoEncryption())
-    ).decode()
-    pub_b64 = base64.urlsafe_b64encode(
-        pub.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
-    ).decode()
-    return priv_b64, pub_b64
-
-
-def e2e_encrypt(plaintext: bytes, recipient_pub_b64: str) -> bytes:
-    """Encrypt for recipient using their X25519 public key (ephemeral ECDH)."""
-    recipient_pub_raw = base64.urlsafe_b64decode(recipient_pub_b64 + "==")
-    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PublicKey
-    recipient_pub = X25519PublicKey.from_public_bytes(recipient_pub_raw)
-
-    eph_priv = X25519PrivateKey.generate()
-    eph_pub  = eph_priv.public_key()
-    shared   = eph_priv.exchange(recipient_pub)
-
-    # derive AES key from shared secret via HKDF-SHA256 (manual PBKDF2 on shared||eph_pub)
-    eph_pub_raw = eph_pub.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
-    salt  = eph_pub_raw[:32]
-    key   = _pbkdf2(shared.hex(), salt)
-    nonce = secrets.token_bytes(12)
-    ct    = AESGCM(key).encrypt(nonce, plaintext, None)
-    return VER_E2E + eph_pub_raw + nonce + ct
-
-
-def e2e_decrypt(payload: bytes, recipient_priv_b64: str) -> bytes:
-    """Decrypt E2E bundle using recipient's private key."""
-    if len(payload) < 1 + 32 + 12 + 16:
-        raise ValueError("E2E payload çox qısadır.")
-    if payload[0:1] != VER_E2E:
-        raise ValueError("E2E token versiyası yanlışdır.")
-    eph_pub_raw = payload[1:33]
-    nonce       = payload[33:45]
-    ct          = payload[45:]
-
-    priv_raw = base64.urlsafe_b64decode(recipient_priv_b64 + "==")
-    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PublicKey
-    priv    = X25519PrivateKey.from_private_bytes(priv_raw)
-    eph_pub = X25519PublicKey.from_public_bytes(eph_pub_raw)
-    shared  = priv.exchange(eph_pub)
-
-    salt = eph_pub_raw[:32]
-    key  = _pbkdf2(shared.hex(), salt)
-    try:
-        return AESGCM(key).decrypt(nonce, ct, None)
-    except Exception:
-        raise ValueError("Deşifrə alınmadı — yanlış şəxsi açar və ya dəyişdirilmiş məlumat.")
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def fingerprint(data: bytes) -> str:
-    return hashlib.sha256(data).digest()[:6].hex().upper()
-
-def b64enc(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).decode()
+def b64enc(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).decode()
 
 def b64dec(s: str) -> bytes:
     return base64.urlsafe_b64decode(s + "==")
 
-def genkey(length: int = 32) -> str:
-    """Generate a cryptographically random passphrase (hex)."""
-    return secrets.token_hex(length)
+def fp(b: bytes) -> str:
+    return hashlib.sha256(b).digest()[:5].hex().upper()
 
-EXPIRY_OPTIONS = {
-    "1h":  3600,
-    "6h":  21600,
-    "24h": 86400,
-    "7d":  604800,
-    "∞":   None,
-}
-
+def genkey(n=32) -> str:
+    return secrets.token_hex(n)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  KEYBOARDS
@@ -178,18 +138,20 @@ EXPIRY_OPTIONS = {
 def kb_main():
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🔒 Şifrələ",   callback_data="sym_enc"),
-            InlineKeyboardButton("🔓 Deşifrələ", callback_data="sym_dec"),
+            InlineKeyboardButton("🔒 Şifrələ",    callback_data="sym_enc"),
+            InlineKeyboardButton("🔓 Deşifrələ",  callback_data="sym_dec"),
         ],
         [
             InlineKeyboardButton("📁 Fayl şifrələ",   callback_data="file_enc"),
             InlineKeyboardButton("📂 Fayl deşifrələ", callback_data="file_dec"),
         ],
         [
-            InlineKeyboardButton("🔑 Açar generatoru", callback_data="genkey"),
-            InlineKeyboardButton("🤝 İki tərəfli",     callback_data="e2e_menu"),
+            InlineKeyboardButton("📬 Gələn qutu",      callback_data="inbox"),
+            InlineKeyboardButton("🔗 Mənim linkım",    callback_data="mylink"),
         ],
-        [InlineKeyboardButton("ℹ️ Haqqında", callback_data="about")],
+        [
+            InlineKeyboardButton("🎲 Güclü açar yarat", callback_data="genkey"),
+        ],
     ])
 
 def kb_cancel():
@@ -198,66 +160,77 @@ def kb_cancel():
 def kb_expiry():
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("⏱ 1 saat",  callback_data="exp_1h"),
-            InlineKeyboardButton("⏱ 6 saat",  callback_data="exp_6h"),
-            InlineKeyboardButton("⏱ 24 saat", callback_data="exp_24h"),
+            InlineKeyboardButton("1 saat",    callback_data="exp_1h"),
+            InlineKeyboardButton("6 saat",    callback_data="exp_6h"),
+            InlineKeyboardButton("24 saat",   callback_data="exp_24h"),
         ],
         [
-            InlineKeyboardButton("📅 7 gün",    callback_data="exp_7d"),
+            InlineKeyboardButton("7 gün",      callback_data="exp_7d"),
             InlineKeyboardButton("♾ Sınırsız", callback_data="exp_inf"),
         ],
         [InlineKeyboardButton("❌ Ləğv et", callback_data="cancel")],
     ])
 
-def kb_e2e():
+def kb_back():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Geri", callback_data="back")]])
+
+def kb_inbox_actions():
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("📤 Göndərən (şifrələ)", callback_data="e2e_send"),
-            InlineKeyboardButton("📥 Alan (deşifrələ)",   callback_data="e2e_recv"),
-        ],
-        [InlineKeyboardButton("🔑 Açar cütü yarat", callback_data="e2e_keygen")],
-        [InlineKeyboardButton("⬅️ Geri", callback_data="back")],
+        [InlineKeyboardButton("🗑 Hamısını sil", callback_data="inbox_clear")],
+        [InlineKeyboardButton("⬅️ Geri",         callback_data="back")],
     ])
 
-def kb_back():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Ana menyu", callback_data="back")]])
-
-
 # ══════════════════════════════════════════════════════════════════════════════
-#  COMMAND HANDLERS
+#  /start — həm normal həm də deep-link (t.me/bot?start=send_USERID)
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.clear()
+    args = ctx.args  # deep-link parametri
+
+    # ── Deep-link: kimsə "Sənə şifrəli mesaj göndər" linkindən gəlib ──
+    if args and args[0].startswith("send_"):
+        try:
+            recipient_id = int(args[0][5:])
+        except ValueError:
+            recipient_id = None
+
+        if recipient_id:
+            try:
+                chat = await ctx.bot.get_chat(recipient_id)
+                name = chat.full_name or f"İstifadəçi {recipient_id}"
+            except Exception:
+                name = f"İstifadəçi #{recipient_id}"
+
+            ctx.user_data["send_to_id"]   = recipient_id
+            ctx.user_data["send_to_name"] = name
+            ctx.user_data["mode"]         = "send_msg"
+
+            await update.message.reply_text(
+                f"✉️ *{name}* üçün şifrəli mesaj yazırsın.\n\n"
+                f"Əvvəlcə bir *şifrə açarı* daxil et — "
+                f"bu açarı alıcıya ayrıca (telefon, şəxsən) bildir:\n\n"
+                f"_(Açar nə qədər güclü olsa, şifrələmə o qədər etibarlıdır)_",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🎲 Açar yarat", callback_data="genkey_for_send")],
+                    [InlineKeyboardButton("❌ Ləğv et",    callback_data="cancel")],
+                ]),
+            )
+            return S_SEND_MSG
+
+    # ── Normal start ──────────────────────────────────────────────────────────
     await update.message.reply_text(
-        "🔐 *CryptoBot v2* — Güclü Şifrələmə\n\n"
-        "AES-256-GCM · X25519 ECDH · PBKDF2-SHA256\n\n"
+        "🔐 *CryptoBot* — Güclü Şifrələmə\n\n"
+        "• Mətn və fayl şifrələ/deşifrələ\n"
+        "• 🔗 *Linkinlə* başqaları sənə şifrəli mesaj göndərsin\n"
+        "• 📬 Mesajları *Gələn qutu*-da oxu\n"
+        "• 🎲 Güclü açar yarat\n\n"
         "Nə etmək istəyirsən?",
         parse_mode="Markdown",
         reply_markup=kb_main(),
     )
     return ConversationHandler.END
-
-
-async def cmd_genkey(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    k16 = genkey(16)
-    k32 = genkey(32)
-    await update.message.reply_text(
-        "🔑 *Güclü açar generatoru*\n\n"
-        "128-bit (qısa):\n`" + k16 + "`\n\n"
-        "256-bit (tövsiyə olunan):\n`" + k32 + "`\n\n"
-        "⚠️ _Açarı özəl saxla — itirsən, mətni bərpa etmək mümkünsüz!_",
-        parse_mode="Markdown",
-        reply_markup=kb_back(),
-    )
-    return ConversationHandler.END
-
-
-async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data.clear()
-    await update.message.reply_text("Ləğv edildi.", reply_markup=kb_main())
-    return ConversationHandler.END
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  BUTTON ROUTER
@@ -268,20 +241,26 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     d = q.data
 
-    # ── Expiry selection ──────────────────────────────────────────────────────
-    if d.startswith("exp_"):
-        key_map = {"exp_1h": "1h", "exp_6h": "6h", "exp_24h": "24h", "exp_7d": "7d", "exp_inf": "∞"}
-        label = key_map[d]
+    # ── Expiry seçimi ─────────────────────────────────────────────────────────
+    if d in EXPIRY_OPTIONS:
+        label, ttl = EXPIRY_OPTIONS[d]
         ctx.user_data["expiry_label"] = label
-        ctx.user_data["expiry_sec"]   = EXPIRY_OPTIONS[label]
+        ctx.user_data["expiry_sec"]   = ttl
+        mode = ctx.user_data.get("mode", "")
 
-        mode = ctx.user_data.get("mode")
-        if mode == "file_enc":
+        if "file" in mode:
             await q.edit_message_text(
-                f"📁 *Müddət: {label}*\n\nİndi şifrələnəcək faylı göndər:",
+                f"📁 *Müddət: {label}*\n\nFaylı göndər:",
                 parse_mode="Markdown", reply_markup=kb_cancel(),
             )
             return S_ENC_FILE
+        elif mode == "send_msg_text":
+            await q.edit_message_text(
+                f"✉️ *Müddət: {label}*\n\nMətnini yaz:",
+                parse_mode="Markdown", reply_markup=kb_cancel(),
+            )
+            ctx.user_data["mode"] = "send_msg_final"
+            return S_SEND_MSG
         else:
             await q.edit_message_text(
                 f"⏱ *Müddət: {label}*\n\nŞifrələnəcək mətni yazın:",
@@ -289,19 +268,28 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return S_ENC_TEXT
 
-    # ── Main menu buttons ─────────────────────────────────────────────────────
-    if d == "sym_enc":
-        ctx.user_data.clear()
-        ctx.user_data["mode"] = "sym_enc"
+    # ── Genkey (send üçün) ────────────────────────────────────────────────────
+    if d == "genkey_for_send":
+        k = genkey(16)
         await q.edit_message_text(
-            "🔑 *Şifrə açarı daxil et:*\n_(istənilən söz, cümlə, ya da /genkey ilə alınan açar)_",
+            f"🎲 *Təklif olunan açar:*\n`{k}`\n\n"
+            f"_Bu açarı alıcıya ayrıca bildir, sonra aşağıya yaz:_",
+            parse_mode="Markdown",
+            reply_markup=kb_cancel(),
+        )
+        return S_SEND_MSG
+
+    # ── Şifrələmə ─────────────────────────────────────────────────────────────
+    if d == "sym_enc":
+        ctx.user_data.clear(); ctx.user_data["mode"] = "sym_enc"
+        await q.edit_message_text(
+            "🔑 *Şifrə açarını daxil et:*\n_(istənilən söz və ya cümlə)_",
             parse_mode="Markdown", reply_markup=kb_cancel(),
         )
         return S_ENC_KEY
 
     if d == "sym_dec":
-        ctx.user_data.clear()
-        ctx.user_data["mode"] = "sym_dec"
+        ctx.user_data.clear(); ctx.user_data["mode"] = "sym_dec"
         await q.edit_message_text(
             "🔑 *Şifrə açarını daxil et:*",
             parse_mode="Markdown", reply_markup=kb_cancel(),
@@ -309,8 +297,7 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return S_DEC_KEY
 
     if d == "file_enc":
-        ctx.user_data.clear()
-        ctx.user_data["mode"] = "file_enc"
+        ctx.user_data.clear(); ctx.user_data["mode"] = "file_enc"
         await q.edit_message_text(
             "🔑 *Fayl şifrələmə — açar daxil et:*",
             parse_mode="Markdown", reply_markup=kb_cancel(),
@@ -318,90 +305,202 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return S_ENC_KEY
 
     if d == "file_dec":
-        ctx.user_data.clear()
-        ctx.user_data["mode"] = "file_dec"
+        ctx.user_data.clear(); ctx.user_data["mode"] = "file_dec"
         await q.edit_message_text(
             "🔑 *Fayl deşifrələmə — açar daxil et:*",
             parse_mode="Markdown", reply_markup=kb_cancel(),
         )
         return S_DEC_KEY
 
+    # ── Açar generatoru ───────────────────────────────────────────────────────
     if d == "genkey":
-        k16 = genkey(16)
-        k32 = genkey(32)
+        k16 = genkey(16); k32 = genkey(32)
         await q.edit_message_text(
-            "🔑 *Güclü açar generatoru*\n\n"
+            "🎲 *Güclü açar generatoru*\n\n"
             "128-bit:\n`" + k16 + "`\n\n"
-            "256-bit (tövsiyə):\n`" + k32 + "`\n\n"
-            "⚠️ _Açarı özəl saxla!_",
+            "256-bit _(tövsiyə)_:\n`" + k32 + "`\n\n"
+            "⚠️ Açarı özəl saxla — itirsən bərpa mümkünsüz!",
             parse_mode="Markdown", reply_markup=kb_back(),
         )
         return ConversationHandler.END
 
-    if d == "e2e_menu":
-        ctx.user_data.clear()
+    # ── Mənim linkım ──────────────────────────────────────────────────────────
+    if d == "mylink":
+        uid  = q.from_user.id
+        link = f"https://t.me/{BOT_USERNAME}?start=send_{uid}"
         await q.edit_message_text(
-            "🤝 *İki tərəfli şifrələmə (E2E)*\n\n"
-            "X25519 ECDH alqoritmi ilə yalnız alan şəxsin deşifrə edə biləcəyi mesajlar göndər.\n\n"
-            "*Necə işləyir:*\n"
-            "1. Alan şəxs `Açar cütü yarat` → Sənə public key göndərir\n"
-            "2. Sən `Göndərən` → Public key + mətn → Şifrəli bundle alırsan\n"
-            "3. Alan şəxs `Alan` → Öz private key-i ilə deşifrə edir\n\n"
-            "Nə etmək istəyirsən?",
-            parse_mode="Markdown", reply_markup=kb_e2e(),
+            "🔗 *Sənin şəxsi şifrəli mesaj linkin:*\n\n"
+            f"`{link}`\n\n"
+            "Bu linki istənilən yerə paylaş.\n"
+            "Kimsə linki açsın → açar seçsin → mətn yazsın → sənin *Gələn qutu*na düşür.\n\n"
+            "📬 Mesajları oxumaq üçün → *Gələn qutu* düyməsinə bas.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📬 Gələn qutu", callback_data="inbox")],
+                [InlineKeyboardButton("⬅️ Geri",       callback_data="back")],
+            ]),
         )
         return ConversationHandler.END
 
-    if d == "e2e_keygen":
-        priv_b64, pub_b64 = e2e_generate_keypair()
+    # ── Gələn qutu ────────────────────────────────────────────────────────────
+    if d == "inbox":
+        uid      = q.from_user.id
+        messages = inbox_get(uid)
+        if not messages:
+            await q.edit_message_text(
+                "📬 *Gələn qutu boşdur.*\n\n"
+                f"Linkini paylaş: `https://t.me/{BOT_USERNAME}?start=send_{uid}`",
+                parse_mode="Markdown", reply_markup=kb_back(),
+            )
+            return ConversationHandler.END
+
         await q.edit_message_text(
-            "🔑 *X25519 Açar Cütü*\n\n"
-            "📢 *Public key* (qarşı tərəfə göndər):\n`" + pub_b64 + "`\n\n"
-            "🔒 *Private key* (YALNIZ SƏNİN — heç kimə vermə):\n`" + priv_b64 + "`\n\n"
-            "⚠️ _Private key-i özəl yerdə saxla. İtirsən, mesajları bərpa etmək mümkünsüz!_",
-            parse_mode="Markdown", reply_markup=kb_back(),
+            f"📬 *Gələn qutu* — {len(messages)} mesaj\n\n"
+            "Mesajları oxumaq üçün *şifrə açarını* daxil et\n"
+            "_(hər mesajın açarı göndərən tərəfindən bildirilmişdir)_",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔓 Oxu",          callback_data="inbox_read")],
+                [InlineKeyboardButton("🗑 Hamısını sil", callback_data="inbox_clear")],
+                [InlineKeyboardButton("⬅️ Geri",         callback_data="back")],
+            ]),
         )
         return ConversationHandler.END
 
-    if d == "e2e_send":
-        ctx.user_data.clear()
-        ctx.user_data["mode"] = "e2e_send"
+    if d == "inbox_read":
+        uid      = q.from_user.id
+        messages = inbox_get(uid)
+        if not messages:
+            await q.edit_message_text("📭 Qutu boşdur.", reply_markup=kb_back())
+            return ConversationHandler.END
+        ctx.user_data["inbox_msgs"] = messages
+        ctx.user_data["inbox_uid"]  = uid
+        ctx.user_data["mode"]       = "inbox_read"
         await q.edit_message_text(
-            "📤 *E2E Göndərən*\n\nAlıcının *public key*-ni yapışdır:",
+            f"📬 {len(messages)} mesaj var.\n\n🔑 Şifrə açarını daxil et:",
             parse_mode="Markdown", reply_markup=kb_cancel(),
         )
-        return E2E_SEND_PUBKEY
+        return S_INBOX_KEY
 
-    if d == "e2e_recv":
-        ctx.user_data.clear()
-        ctx.user_data["mode"] = "e2e_recv"
-        await q.edit_message_text(
-            "📥 *E2E Alan*\n\nÖz *private key*-ini yapışdır:",
-            parse_mode="Markdown", reply_markup=kb_cancel(),
-        )
-        return E2E_RECV_PRIVKEY
-
-    if d == "about":
-        await q.edit_message_text(
-            "ℹ️ *CryptoBot v2 — Texniki Məlumat*\n\n"
-            "🔐 Simmetrik: AES-256-GCM\n"
-            "🤝 E2E: X25519 ECDH\n"
-            "🔑 Açar törəmə: PBKDF2-SHA256 · 600,000 iter\n"
-            "🎲 Salt: 256-bit random\n"
-            "📦 Nonce: 96-bit random\n"
-            "✅ Auth: GCM 128-bit tag\n"
-            "⏱ Token müddəti: AAD içinə daxil (tamper-proof)\n"
-            "📁 Fayl: binary-safe (istənilən format)\n\n"
-            "Hər şifrələmə unikaldır.",
-            parse_mode="Markdown", reply_markup=kb_back(),
-        )
+    if d == "inbox_clear":
+        uid = q.from_user.id
+        inbox_clear(uid)
+        await q.edit_message_text("🗑 Gələn qutu təmizləndi.", reply_markup=kb_back())
         return ConversationHandler.END
 
+    # ── Cancel / Back ─────────────────────────────────────────────────────────
     if d in ("cancel", "back"):
         ctx.user_data.clear()
         await q.edit_message_text("Ana menyu:", reply_markup=kb_main())
         return ConversationHandler.END
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  SEND MSG FLOW  (deep-link gələn)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def send_msg_step(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    mode = ctx.user_data.get("mode", "")
+
+    # İlk addım: açar daxil edilir
+    if "key" not in ctx.user_data.get("send_key", "x"):
+        if "send_key" not in ctx.user_data:
+            ctx.user_data["send_key"] = text
+            ctx.user_data["mode"]     = "send_msg_text"
+            await update.message.reply_text(
+                f"✅ Açar qeyd edildi.\n\n"
+                f"⏱ Token neçə müddət etibarlı olsun?",
+                reply_markup=kb_expiry(),
+            )
+            return S_SEND_MSG
+
+    # Son addım: mətn daxil edilir (expiry seçildikdən sonra)
+    if mode == "send_msg_final":
+        password     = ctx.user_data["send_key"]
+        recipient_id = ctx.user_data["send_to_id"]
+        sender_name  = update.effective_user.full_name or "Anonim"
+        ttl          = ctx.user_data.get("expiry_sec")
+        label        = ctx.user_data.get("expiry_label", "Sınırsız")
+
+        try:
+            raw   = sym_encrypt(text.encode(), password, ttl)
+            token = b64enc(raw)
+            inbox_add(recipient_id, sender_name, token, label)
+
+            # Alıcıya bildiriş göndər
+            try:
+                await ctx.bot.send_message(
+                    chat_id=recipient_id,
+                    text=f"📬 *Yeni şifrəli mesaj!*\n\nGöndərən: *{sender_name}*\nMüddət: {label}\n\n_Oxumaq üçün /inbox_",
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                pass  # Alıcı bota start etməyibsə
+
+            await update.message.reply_text(
+                f"✅ *Mesaj göndərildi!*\n\n"
+                f"📬 Alıcı bildiriş alacaq.\n"
+                f"⏱ Müddət: {label}",
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            logger.exception("send_msg error")
+            await update.message.reply_text(f"❌ Xəta: {e}")
+
+        ctx.user_data.clear()
+        return ConversationHandler.END
+
+    return S_SEND_MSG
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  INBOX READ FLOW
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def inbox_key_step(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    password = update.message.text.strip()
+    messages = ctx.user_data.get("inbox_msgs", [])
+    uid      = ctx.user_data.get("inbox_uid")
+
+    if not messages:
+        await update.message.reply_text("📭 Qutu boşdur.", reply_markup=kb_main())
+        ctx.user_data.clear()
+        return ConversationHandler.END
+
+    success = 0
+    fail    = 0
+    lines   = []
+
+    for i, item in enumerate(messages, 1):
+        try:
+            raw  = b64dec(item["msg"])
+            text = sym_decrypt(raw, password).decode()
+            ts   = datetime.fromtimestamp(item["time"]).strftime("%d.%m %H:%M")
+            lines.append(f"*{i}.* 👤 {item['from']} · {ts}\n`{text}`")
+            success += 1
+        except ValueError as e:
+            lines.append(f"*{i}.* ❌ `{e}`")
+            fail += 1
+
+    summary = f"✅ {success} oxundu" + (f"  |  ❌ {fail} açılmadı" if fail else "")
+    full    = summary + "\n\n" + "\n\n".join(lines)
+
+    # Telegram 4096 limit
+    if len(full) <= 4000:
+        await update.message.reply_text(full, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(summary, parse_mode="Markdown")
+        for chunk in lines:
+            await update.message.reply_text(chunk, parse_mode="Markdown")
+
+    await update.message.reply_text(
+        "Silmək istəyirsən?",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑 Hamısını sil", callback_data="inbox_clear")],
+            [InlineKeyboardButton("⬅️ Ana menyu",   callback_data="back")],
+        ]),
+    )
+    ctx.user_data.clear()
+    return ConversationHandler.END
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  SYMMETRIC ENCRYPT FLOW
@@ -409,48 +508,33 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def got_enc_key(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["enc_key"] = update.message.text.strip()
-    await update.message.reply_text(
-        "⏱ *Token neçə müddət etibarlı olsun?*",
-        parse_mode="Markdown", reply_markup=kb_expiry(),
-    )
+    await update.message.reply_text("⏱ Token neçə müddət etibarlı olsun?", reply_markup=kb_expiry())
     return S_ENC_EXPIRY
 
-
 async def got_enc_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    plaintext = update.message.text.strip().encode()
-    password  = ctx.user_data["enc_key"]
-    ttl       = ctx.user_data.get("expiry_sec")
-    label     = ctx.user_data.get("expiry_label", "∞")
-
+    pw    = ctx.user_data["enc_key"]
+    ttl   = ctx.user_data.get("expiry_sec")
+    label = ctx.user_data.get("expiry_label", "Sınırsız")
     try:
-        raw   = sym_encrypt(plaintext, password, ttl)
+        raw   = sym_encrypt(update.message.text.strip().encode(), pw, ttl)
         token = b64enc(raw)
-        fp    = fingerprint(raw)
-        exp_str = f"⏱ Müddət: {label}" if label != "∞" else "♾ Müddətsiz"
-
-        if len(token) <= 3500:
-            await update.message.reply_text(
-                f"✅ *Şifrələndi!*\n\n"
-                f"🔏 Token:\n`{token}`\n\n"
-                f"🆔 Barmaq izi: `{fp}`\n"
-                f"{exp_str}",
-                parse_mode="Markdown",
-            )
+        fprint = fp(raw)
+        msg = (
+            f"✅ *Şifrələndi!*\n\n"
+            f"🔏 Token:\n`{token}`\n\n"
+            f"🆔 `{fprint}`  ·  ⏱ {label}"
+        )
+        if len(msg) <= 4000:
+            await update.message.reply_text(msg, parse_mode="Markdown")
         else:
-            await update.message.reply_text(
-                f"✅ Şifrələndi! `{fp}` | {exp_str}\n_(token uzundur, aşağıda)_",
-                parse_mode="Markdown",
-            )
+            await update.message.reply_text(f"✅ `{fprint}` · {label}", parse_mode="Markdown")
             for i in range(0, len(token), 4000):
                 await update.message.reply_text(f"`{token[i:i+4000]}`", parse_mode="Markdown")
     except Exception as e:
-        logger.exception("Encrypt error")
-        await update.message.reply_text(f"❌ Xəta: {e}")
-
+        await update.message.reply_text(f"❌ {e}")
     ctx.user_data.clear()
     await update.message.reply_text("Ana menyu:", reply_markup=kb_main())
     return ConversationHandler.END
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  SYMMETRIC DECRYPT FLOW
@@ -458,206 +542,114 @@ async def got_enc_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def got_dec_key(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["dec_key"] = update.message.text.strip()
-    mode = ctx.user_data.get("mode")
-    if mode == "file_dec":
-        await update.message.reply_text(
-            "📂 Şifrəli faylı göndər:", reply_markup=kb_cancel()
-        )
+    if ctx.user_data.get("mode") == "file_dec":
+        await update.message.reply_text("📂 Şifrəli faylı göndər:", reply_markup=kb_cancel())
         return S_DEC_FILE
-    else:
-        await update.message.reply_text(
-            "📋 *Şifrəli tokeni yapışdır:*",
-            parse_mode="Markdown", reply_markup=kb_cancel(),
-        )
-        return S_DEC_TOKEN
-
+    await update.message.reply_text("📋 Şifrəli tokeni yapışdır:", reply_markup=kb_cancel())
+    return S_DEC_TOKEN
 
 async def got_dec_token(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    token    = update.message.text.strip()
-    password = ctx.user_data["dec_key"]
+    pw = ctx.user_data["dec_key"]
     try:
-        raw  = b64dec(token)
-        data = sym_decrypt(raw, password)
-        text = data.decode("utf-8")
-        await update.message.reply_text(
-            f"✅ *Deşifrə uğurlu!*\n\n📄 Mətn:\n`{text}`",
-            parse_mode="Markdown",
-        )
+        raw  = b64dec(update.message.text.strip())
+        text = sym_decrypt(raw, pw).decode()
+        await update.message.reply_text(f"✅ *Deşifrə uğurlu!*\n\n`{text}`", parse_mode="Markdown")
     except ValueError as e:
-        await update.message.reply_text(f"❌ *Xəta:* `{e}`", parse_mode="Markdown")
+        await update.message.reply_text(f"❌ `{e}`", parse_mode="Markdown")
     except Exception:
-        logger.exception("Decrypt error")
         await update.message.reply_text("❌ Deşifrə alınmadı.")
-
     ctx.user_data.clear()
     await update.message.reply_text("Ana menyu:", reply_markup=kb_main())
     return ConversationHandler.END
 
-
 # ══════════════════════════════════════════════════════════════════════════════
-#  FILE ENCRYPT / DECRYPT FLOW
+#  FILE FLOWS
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def got_enc_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    doc      = update.message.document
-    password = ctx.user_data["enc_key"]
-    ttl      = ctx.user_data.get("expiry_sec")
-    label    = ctx.user_data.get("expiry_label", "∞")
-
+    doc = update.message.document
     if not doc:
-        await update.message.reply_text("❌ Fayl göndərilmədi. Yenidən cəhd et.")
+        await update.message.reply_text("❌ Fayl göndərilmədi.")
         return S_ENC_FILE
-
-    tg_file  = await doc.get_file()
-    buf      = io.BytesIO()
-    await tg_file.download_to_memory(buf)
-    raw_data = buf.getvalue()
-
+    pw    = ctx.user_data["enc_key"]
+    ttl   = ctx.user_data.get("expiry_sec")
+    label = ctx.user_data.get("expiry_label", "Sınırsız")
+    buf   = io.BytesIO()
+    await (await doc.get_file()).download_to_memory(buf)
+    raw   = buf.getvalue()
     try:
-        encrypted = sym_encrypt(raw_data, password, ttl)
-        fp        = fingerprint(encrypted)
-        orig_name = doc.file_name or "file"
-        out_name  = orig_name + ".enc"
-        exp_str   = f"⏱ {label}" if label != "∞" else "♾ Müddətsiz"
-
+        enc  = sym_encrypt(raw, pw, ttl)
+        name = (doc.file_name or "file") + ".enc"
         await update.message.reply_document(
-            document=io.BytesIO(encrypted),
-            filename=out_name,
-            caption=(
-                f"✅ Şifrələndi — `{orig_name}`\n"
-                f"🆔 Barmaq izi: `{fp}`\n"
-                f"{exp_str}\n"
-                f"📦 Ölçü: {len(raw_data):,} → {len(encrypted):,} bayt"
-            ),
+            io.BytesIO(enc), filename=name,
+            caption=f"✅ `{doc.file_name}` şifrələndi\n🆔 `{fp(enc)}`  ·  ⏱ {label}",
             parse_mode="Markdown",
         )
     except Exception as e:
-        logger.exception("File encrypt error")
-        await update.message.reply_text(f"❌ Xəta: {e}")
-
+        await update.message.reply_text(f"❌ {e}")
     ctx.user_data.clear()
     await update.message.reply_text("Ana menyu:", reply_markup=kb_main())
     return ConversationHandler.END
-
 
 async def got_dec_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    doc      = update.message.document
-    password = ctx.user_data["dec_key"]
-
+    doc = update.message.document
     if not doc:
-        await update.message.reply_text("❌ Fayl göndərilmədi. Yenidən cəhd et.")
+        await update.message.reply_text("❌ Fayl göndərilmədi.")
         return S_DEC_FILE
-
-    tg_file  = await doc.get_file()
-    buf      = io.BytesIO()
-    await tg_file.download_to_memory(buf)
-    enc_data = buf.getvalue()
-
+    pw  = ctx.user_data["dec_key"]
+    buf = io.BytesIO()
+    await (await doc.get_file()).download_to_memory(buf)
     try:
-        decrypted = sym_decrypt(enc_data, password)
-        orig_name = doc.file_name or "file.enc"
-        out_name  = orig_name.removesuffix(".enc") if orig_name.endswith(".enc") else "decrypted_" + orig_name
-
-        await update.message.reply_document(
-            document=io.BytesIO(decrypted),
-            filename=out_name,
-            caption=f"✅ Deşifrə uğurlu — `{out_name}`\n📦 {len(decrypted):,} bayt",
-            parse_mode="Markdown",
-        )
+        dec  = sym_decrypt(buf.getvalue(), pw)
+        name = doc.file_name.removesuffix(".enc") if doc.file_name and doc.file_name.endswith(".enc") else "decrypted_" + (doc.file_name or "file")
+        await update.message.reply_document(io.BytesIO(dec), filename=name, caption=f"✅ Deşifrə uğurlu — `{name}`", parse_mode="Markdown")
     except ValueError as e:
-        await update.message.reply_text(f"❌ *Xəta:* `{e}`", parse_mode="Markdown")
+        await update.message.reply_text(f"❌ `{e}`", parse_mode="Markdown")
     except Exception:
-        logger.exception("File decrypt error")
         await update.message.reply_text("❌ Deşifrə alınmadı.")
-
     ctx.user_data.clear()
     await update.message.reply_text("Ana menyu:", reply_markup=kb_main())
     return ConversationHandler.END
-
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  E2E FLOW
+#  COMMANDS
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def e2e_got_pubkey(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    pub_b64 = update.message.text.strip()
-    # basic length check (X25519 pub = 32 bytes → 43 chars base64url)
-    try:
-        raw = b64dec(pub_b64)
-        if len(raw) != 32:
-            raise ValueError
-    except Exception:
-        await update.message.reply_text("❌ Public key formatı yanlışdır. 43 simvol olmalıdır.")
-        return E2E_SEND_PUBKEY
-
-    ctx.user_data["e2e_pub"] = pub_b64
+async def cmd_genkey(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "✏️ *Göndərəcəyin mətni yaz:*",
+        "🎲 *Güclü açar generatoru*\n\n"
+        "128-bit:\n`" + genkey(16) + "`\n\n"
+        "256-bit _(tövsiyə)_:\n`" + genkey(32) + "`",
+        parse_mode="Markdown",
+    )
+
+async def cmd_mylink(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid  = update.effective_user.id
+    link = f"https://t.me/{BOT_USERNAME}?start=send_{uid}"
+    await update.message.reply_text(
+        f"🔗 *Sənin linkin:*\n`{link}`\n\nPaylaş — kimsə mesaj göndərsin.",
+        parse_mode="Markdown",
+    )
+
+async def cmd_inbox(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid  = update.effective_user.id
+    msgs = inbox_get(uid)
+    if not msgs:
+        await update.message.reply_text("📭 Gələn qutu boşdur.")
+        return
+    ctx.user_data["inbox_msgs"] = msgs
+    ctx.user_data["inbox_uid"]  = uid
+    ctx.user_data["mode"]       = "inbox_read"
+    await update.message.reply_text(
+        f"📬 *{len(msgs)} şifrəli mesaj var.*\n\n🔑 Açarı daxil et:",
         parse_mode="Markdown", reply_markup=kb_cancel(),
     )
-    return E2E_SEND_MSG
+    return S_INBOX_KEY
 
-
-async def e2e_got_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    pub_b64   = ctx.user_data["e2e_pub"]
-    plaintext = update.message.text.strip().encode()
-    try:
-        bundle  = e2e_encrypt(plaintext, pub_b64)
-        token   = b64enc(bundle)
-        fp      = fingerprint(bundle)
-        await update.message.reply_text(
-            f"✅ *E2E Şifrələndi!*\n\n"
-            f"📦 Bundle (alıcıya göndər):\n`{token}`\n\n"
-            f"🆔 Barmaq izi: `{fp}`\n\n"
-            f"_Yalnız alıcının private key-i ilə açıla bilər._",
-            parse_mode="Markdown",
-        )
-    except Exception as e:
-        await update.message.reply_text(f"❌ Xəta: {e}")
-
+async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.clear()
-    await update.message.reply_text("Ana menyu:", reply_markup=kb_main())
+    await update.message.reply_text("Ləğv edildi.", reply_markup=kb_main())
     return ConversationHandler.END
-
-
-async def e2e_got_privkey(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    priv_b64 = update.message.text.strip()
-    try:
-        raw = b64dec(priv_b64)
-        if len(raw) != 32:
-            raise ValueError
-    except Exception:
-        await update.message.reply_text("❌ Private key formatı yanlışdır.")
-        return E2E_RECV_PRIVKEY
-
-    ctx.user_data["e2e_priv"] = priv_b64
-    await update.message.reply_text(
-        "📦 *E2E bundle-i (şifrəli tokeni) yapışdır:*",
-        parse_mode="Markdown", reply_markup=kb_cancel(),
-    )
-    return E2E_RECV_BUNDLE
-
-
-async def e2e_got_bundle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    priv_b64 = ctx.user_data["e2e_priv"]
-    token    = update.message.text.strip()
-    try:
-        bundle    = b64dec(token)
-        plaintext = e2e_decrypt(bundle, priv_b64)
-        await update.message.reply_text(
-            f"✅ *E2E Deşifrə uğurlu!*\n\n📄 Mətn:\n`{plaintext.decode()}`",
-            parse_mode="Markdown",
-        )
-    except ValueError as e:
-        await update.message.reply_text(f"❌ *Xəta:* `{e}`", parse_mode="Markdown")
-    except Exception:
-        logger.exception("E2E decrypt error")
-        await update.message.reply_text("❌ Deşifrə alınmadı.")
-
-    ctx.user_data.clear()
-    await update.message.reply_text("Ana menyu:", reply_markup=kb_main())
-    return ConversationHandler.END
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  MAIN
@@ -665,7 +657,7 @@ async def e2e_got_bundle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 def main():
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN mühit dəyişəni təyin edilməyib!")
+        raise RuntimeError("BOT_TOKEN təyin edilməyib!")
 
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -673,34 +665,20 @@ def main():
         entry_points=[
             CommandHandler("start",  cmd_start),
             CommandHandler("genkey", cmd_genkey),
+            CommandHandler("mylink", cmd_mylink),
+            CommandHandler("inbox",  cmd_inbox),
             CallbackQueryHandler(button_handler),
         ],
         states={
-            # symmetric encrypt
-            S_ENC_KEY:    [MessageHandler(filters.TEXT & ~filters.COMMAND, got_enc_key),
-                           CallbackQueryHandler(button_handler)],
+            S_ENC_KEY:    [MessageHandler(filters.TEXT & ~filters.COMMAND, got_enc_key),   CallbackQueryHandler(button_handler)],
             S_ENC_EXPIRY: [CallbackQueryHandler(button_handler)],
-            S_ENC_TEXT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, got_enc_text),
-                           CallbackQueryHandler(button_handler)],
-            S_ENC_FILE:   [MessageHandler(filters.Document.ALL, got_enc_file),
-                           CallbackQueryHandler(button_handler)],
-            # symmetric decrypt
-            S_DEC_KEY:    [MessageHandler(filters.TEXT & ~filters.COMMAND, got_dec_key),
-                           CallbackQueryHandler(button_handler)],
-            S_DEC_TOKEN:  [MessageHandler(filters.TEXT & ~filters.COMMAND, got_dec_token),
-                           CallbackQueryHandler(button_handler)],
-            S_DEC_FILE:   [MessageHandler(filters.Document.ALL, got_dec_file),
-                           CallbackQueryHandler(button_handler)],
-            # E2E send
-            E2E_SEND_PUBKEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, e2e_got_pubkey),
-                              CallbackQueryHandler(button_handler)],
-            E2E_SEND_MSG:    [MessageHandler(filters.TEXT & ~filters.COMMAND, e2e_got_msg),
-                              CallbackQueryHandler(button_handler)],
-            # E2E recv
-            E2E_RECV_PRIVKEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, e2e_got_privkey),
-                               CallbackQueryHandler(button_handler)],
-            E2E_RECV_BUNDLE:  [MessageHandler(filters.TEXT & ~filters.COMMAND, e2e_got_bundle),
-                               CallbackQueryHandler(button_handler)],
+            S_ENC_TEXT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, got_enc_text),  CallbackQueryHandler(button_handler)],
+            S_ENC_FILE:   [MessageHandler(filters.Document.ALL, got_enc_file),             CallbackQueryHandler(button_handler)],
+            S_DEC_KEY:    [MessageHandler(filters.TEXT & ~filters.COMMAND, got_dec_key),   CallbackQueryHandler(button_handler)],
+            S_DEC_TOKEN:  [MessageHandler(filters.TEXT & ~filters.COMMAND, got_dec_token), CallbackQueryHandler(button_handler)],
+            S_DEC_FILE:   [MessageHandler(filters.Document.ALL, got_dec_file),             CallbackQueryHandler(button_handler)],
+            S_SEND_MSG:   [MessageHandler(filters.TEXT & ~filters.COMMAND, send_msg_step), CallbackQueryHandler(button_handler)],
+            S_INBOX_KEY:  [MessageHandler(filters.TEXT & ~filters.COMMAND, inbox_key_step),CallbackQueryHandler(button_handler)],
         },
         fallbacks=[
             CommandHandler("cancel", cmd_cancel),
@@ -710,7 +688,7 @@ def main():
     )
 
     app.add_handler(conv)
-    logger.info("CryptoBot v2 işə düşdü...")
+    logger.info("CryptoBot v3 işə düşdü ✅")
     app.run_polling(drop_pending_updates=True)
 
 
