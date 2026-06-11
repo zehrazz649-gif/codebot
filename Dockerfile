@@ -10,6 +10,6 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY bot_steg.py .
+COPY bot.py .
 
-CMD ["python", "bot_steg.py"]
+CMD ["python", "bot.py"]
