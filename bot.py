@@ -226,12 +226,12 @@ def sign_decrypt(payload: bytes, password: str) -> tuple[bytes, bool]:
 # ── Steganography (LSB) ────────────────────────────────────────────────────────
 
 def steg_hide(img_bytes: bytes, secret_bytes: bytes) -> bytes:
-    """Şifrəli mətn-i PNG şəkilin LSB-lərinə gizlət."""
+    """Şifrəli mətn-i şəkilin LSB-lərinə gizlət. İstənilən format qəbul edilir."""
+    # İstənilən formatı RGB PNG-yə çevir
     img  = Image.open(io.BytesIO(img_bytes)).convert("RGB")
     data = np.array(img, dtype=np.uint8)
     flat = data.flatten()
 
-    # Uzunluq prefix (4 bayt big-endian) + məzmun
     payload = struct.pack(">I", len(secret_bytes)) + secret_bytes
     bits    = np.unpackbits(np.frombuffer(payload, dtype=np.uint8))
 
@@ -246,10 +246,11 @@ def steg_hide(img_bytes: bytes, secret_bytes: bytes) -> bytes:
     return buf.getvalue()
 
 def steg_reveal(img_bytes: bytes) -> bytes:
-    """Şəkilin LSB-lərindən gizli məzmunu çıxart."""
+    """Şəkilin LSB-lərindən gizli məzmunu çıxart. İstənilən format qəbul edilir."""
+    # İstənilən formatı RGB-yə çevir (JPEG kompressiyası məlumatı məhv edir,
+    # buna görə yalnız botdan göndərilmiş orijinal fayllar işləyir)
     img  = Image.open(io.BytesIO(img_bytes)).convert("RGB")
     flat = np.array(img, dtype=np.uint8).flatten()
-    # Əvvəlcə uzunluq oxu (4 bayt = 32 bit)
     len_bits = flat[:32] & 1
     length   = int(np.packbits(len_bits).tobytes().hex(), 16)
     if length == 0 or length > len(flat) // 8:
@@ -1049,10 +1050,21 @@ async def steg_hide_text_step(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def steg_hide_img_step(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    photo = update.message.photo or (update.message.document if update.message.document and
-                                     update.message.document.mime_type == "image/png" else None)
-    if not photo:
-        await update.message.reply_text("❌ PNG şəkil göndər.")
+
+    # Fayl kimi göndərilmiş şəkil (hər format)
+    if update.message.document:
+        photo = update.message.document
+    elif update.message.photo:
+        # Telegram photo-ları JPEG-ə çevirir — LSB-lər pozulur
+        # Yenə də cəhd edirik amma xəbərdarlıq göndəririk
+        photo = update.message.photo[-1]
+        await update.message.reply_text(
+            "⚠️ *Diqqət:* Telegram şəkilləri JPEG-ə çevirir və steganography məlumatları pozulur.\n"
+            "Daha etibarlı nəticə üçün şəkili **fayl kimi** göndər (📎 → Fayl).",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text("❌ Şəkil və ya fayl göndər.")
         return S_STEG_HIDE_IMG
 
     payload = ctx.user_data.get("steg_payload")
@@ -1061,10 +1073,7 @@ async def steg_hide_img_step(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     buf = io.BytesIO()
-    if isinstance(photo, list):
-        file_obj = await (photo[-1]).get_file()
-    else:
-        file_obj = await photo.get_file()
+    file_obj = await photo.get_file()
     await file_obj.download_to_memory(buf)
 
     try:
@@ -1072,7 +1081,9 @@ async def steg_hide_img_step(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_document(
             io.BytesIO(result_bytes),
             filename="hidden.png",
-            caption="🖼 Şəklə gizlədildi! Bu PNG-ni paylaş — heç kim bilməz.",
+            caption="🖼 Şəklə gizlədildi!\n\n"
+                    "⚠️ Bu faylı **fayl kimi** göndər (yox şəkil kimi) — "
+                    "Telegram şəkil kimi göndərəndə JPEG-ə çevirir və məlumat pozulur.",
         )
     except ValueError as e:
         await update.message.reply_text(f"❌ {e}")
@@ -1094,19 +1105,24 @@ async def steg_reveal_key_step(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return S_STEG_REVEAL_IMG
 
 async def steg_reveal_img_step(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid   = update.effective_user.id
-    photo = update.message.photo or (update.message.document if update.message.document and
-                                     update.message.document.mime_type == "image/png" else None)
-    if not photo:
-        await update.message.reply_text("❌ PNG şəkil göndər.")
+    uid = update.effective_user.id
+
+    if update.message.document:
+        photo = update.message.document
+    elif update.message.photo:
+        photo = update.message.photo[-1]
+        await update.message.reply_text(
+            "⚠️ Şəkil JPEG kimi göndərildi. Əgər məlumat tapılmazsa, "
+            "faylı **📎 Fayl kimi** göndər.",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text("❌ Şəkil və ya fayl göndər.")
         return S_STEG_REVEAL_IMG
 
     pw  = ctx.user_data.get("steg_reveal_key", "")
     buf = io.BytesIO()
-    if isinstance(photo, list):
-        file_obj = await (photo[-1]).get_file()
-    else:
-        file_obj = await photo.get_file()
+    file_obj = await photo.get_file()
     await file_obj.download_to_memory(buf)
 
     try:
