@@ -1,8 +1,7 @@
 FROM python:3.11-slim
 
-# pyzbar üçün sistem kitabxanası
 RUN apt-get update && \
-    apt-get install -y libzbar0 libzbar-dev && \
+    apt-get install -y libzbar0 libzbar-dev gcc && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
